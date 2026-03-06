@@ -2,8 +2,8 @@
 name: inquiry-1688
 description: >-
   向1688供应商发起询盘，获取供应商对商品问题的回复。用户提供1688商品链接和自由文本问题，
-  skill自动发起询盘任务，通过cron调度isolated session轮询结果（每30秒，最多20分钟），
-  获取到回复后总结反馈给用户。
+  skill自动发起询盘任务，通过sessions_spawn异步轮询结果（每30秒，最多20分钟），
+  获取到回复后自动announce回主session。
   触发词：询盘、问供应商、问商家、咨询供应商、1688询盘、能不能定制、起批量多少、
   商品长宽高、是否可以发货、是否有资质、供应商能不能XXX。
 ---
@@ -19,11 +19,11 @@ description: >-
          ↓
 2. submit 提交询盘 → 获取 taskId → 立即回复用户"已发起"
          ↓
-3. cron 创建一次性定时任务（立即触发 isolated session）
+3. sessions_spawn 启动子agent → 后台轮询等待结果
          ↓
-4. isolated session 运行 poll 命令 → 每30秒查一次，最多20分钟
+4. 子agent 运行 poll 命令 → 每30秒查一次，最多20分钟
          ↓
-5. 结果 announce 回主 session → 总结展示
+5. 子agent 完成后自动 announce 回主 session → 用户看到结果
 ```
 
 ## Step 1: 提取信息
@@ -46,40 +46,35 @@ python3 scripts/inquiry.py submit "<商品链接或ID>" "<询盘问题>" [--quan
 
 > 询盘已发送给供应商，正在等待回复（最多20分钟），有结果会自动通知你 ✅
 
-## Step 3: cron 触发 isolated session 轮询
+## Step 3: sessions_spawn 异步轮询
 
-使用 cron 创建一次性任务，**1分钟后触发**（给询盘一点初始处理时间）：
+使用 `sessions_spawn` 启动子agent后台轮询，结果自动 announce 回当前会话。
 
-⚠️ **时间计算必须用 `date` 命令获取准确的 UTC ISO-8601 时间，禁止手动心算！**
-```bash
-# 获取1分钟后的 UTC ISO-8601 时间戳（用于 cron schedule.at）
-date -u -d '+1 minute' --iso-8601=seconds
-```
+**调用参数：**
+- **task**: 轮询指令（见下方模板）
+- **runTimeoutSeconds**: `1400`（略大于20分钟轮询 + 60秒初始等待）
+- **label**: `inquiry-poll-{商品ID}`（便于追踪）
 
-- **schedule.kind**: `at`
-- **schedule.at**: 上面命令输出的 UTC 时间戳
-- **sessionTarget**: `isolated`
-- **payload.kind**: `agentTurn`
-- **payload.timeoutSeconds**: `1300`（略大于20分钟轮询时间）
-- **delivery.channel**: 必须填写当前会话的 channel（如 `webchat`、`dingtalk` 等），否则结果无法送达！
-
-cron message 模板：
+**task 模板：**
 
 ```
 请轮询1688询盘任务结果并总结。
 
 执行步骤：
-1. 运行轮询（每30秒查一次，最多20分钟）:
+1. 先等待60秒（给询盘初始处理时间）：
+   sleep 60
+
+2. 运行轮询（每30秒查一次，最多20分钟）:
    python3 /home/admin/.openclaw/workspace/skills/inquiry-1688/scripts/inquiry.py poll "{taskId}"
 
-2. 轮询结束后解析JSON结果，重点关注：
+3. 轮询结束后解析JSON结果，重点关注：
    - taskInfo.status（任务状态）
    - aiSummary（AI总结，markdown格式）
    - supplierCompare[].inquiryAnswers（各问题回复）
    - supplierCompare[].sellerInfo（供应商信息）
    - supplierCompare[].messages（完整聊天记录）
 
-3. 按以下格式总结：
+4. 按以下格式总结：
 
 ### 📋 询盘结果
 
@@ -95,13 +90,25 @@ cron message 模板：
 - 进度: {progress}
 - 回复详情: {inquiryAnswers}
 
-4. 如果超时仍未完成，说明当前进度，告知用户可稍后手动查询。
+5. 如果超时仍未完成，说明当前进度，告知用户可稍后手动查询。
 
 原始信息：
 - 任务ID: {taskId}
 - 商品链接: {链接}
 - 询盘问题: {用户的问题}
 ```
+
+### 为什么用 sessions_spawn 而不是 cron？
+
+> **教训记录（2026-03-05 ~ 03-06）：** 之前用 cron isolated session 方案连续失败三次：
+> 1. delivery 没配 channel → 报错 "cron delivery target is missing"
+> 2. 手算 UTC 时间算错 → 任务延迟 1 小时才触发
+> 3. 时间和 channel 都对了，但 announce 仍未送达
+>
+> `sessions_spawn` 的优势：
+> - **自动 announce 回发起者会话**，无需手动配置 delivery channel
+> - **立即启动**，无需计算触发时间
+> - **更简单可靠**，少了 cron 调度这一层中间环节
 
 ## 脚本命令参考
 
@@ -115,7 +122,6 @@ cron message 模板：
 
 - `questionList` 固定填 `["自定义"]`，用户实际问题放入 `requirementContent`
 - `isRequirementOriginal` 设为 `true`，原文发送
-- poll 命令会阻塞最多20分钟，必须在 isolated session 中运行
-- cron payload 的 `timeoutSeconds` 设为 1300 以确保轮询不被截断
-- ⚠️ **cron 时间必须用 `date -u -d '+1 minute' --iso-8601=seconds` 计算，禁止手动心算 UTC 时间！**（教训：2026-03-06 手算 UTC 偏移导致任务延迟 1 小时才触发）
-- ⚠️ **delivery 必须配置 channel**（如 `webchat`、`dingtalk`），否则 isolated session 跑完结果无法送达！（教训：2026-03-05 delivery 缺少 channel 导致报错 "cron delivery target is missing"）
+- poll 命令会阻塞最多20分钟，必须在子agent session 中运行（通过 sessions_spawn）
+- `runTimeoutSeconds` 设为 1400 以确保轮询不被截断（60秒等待 + 1200秒轮询 + 余量）
+- 如果需要手动查询结果，可直接运行 `inquiry.py query "{taskId}"`
