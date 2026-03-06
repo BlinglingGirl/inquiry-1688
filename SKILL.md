@@ -2,28 +2,38 @@
 name: inquiry-1688
 description: >-
   向1688供应商发起询盘，获取供应商对商品问题的回复。用户提供1688商品链接和自由文本问题，
-  skill自动发起询盘任务，通过sessions_spawn异步轮询结果（每30秒，最多20分钟），
-  获取到回复后自动announce回主session或通过message主动推送。
+  skill自动发起询盘任务，等待供应商回复后总结结果。
+  webchat场景在当前session同步轮询；外部channel（钉钉等）用sessions_spawn异步轮询+message主动推送。
   触发词：询盘、问供应商、问商家、咨询供应商、1688询盘、能不能定制、起批量多少、
   商品长宽高、是否可以发货、是否有资质、供应商能不能XXX。
 ---
 
 # 1688 询盘
 
-向1688供应商发起询盘，异步等待结果，自动总结回复。
+向1688供应商发起询盘，等待结果，自动总结回复。
 
-## 工作流程
+## 工作流程（按 channel 区分）
 
+### webchat 场景（同步轮询）
 ```
 1. 提取：1688商品链接 + 询盘问题
          ↓
-2. submit 提交询盘 → 获取 taskId → 立即回复用户"已发起"
+2. submit 提交询盘 → 获取 taskId → 告知用户"已发起，正在等待"
          ↓
-3. sessions_spawn 启动子agent → 后台轮询等待结果
+3. 当前 session 直接运行 poll 命令（每30秒查一次，最多20分钟）
          ↓
-4. 子agent 运行 poll 命令 → 每30秒查一次，最多20分钟
+4. 结果出来后直接回复用户
+```
+
+### 外部 channel 场景（钉钉/Telegram/Discord 等，异步推送）
+```
+1. 提取：1688商品链接 + 询盘问题
          ↓
-5. 结果回传（按 channel 区分，见 Step 3）
+2. submit 提交询盘 → 获取 taskId → 告知用户"已发起，有结果会通知你"
+         ↓
+3. sessions_spawn 启动子agent → 后台轮询
+         ↓
+4. 子agent poll 拿到结果后，用 message 工具主动推送给用户
 ```
 
 ## Step 1: 提取信息
@@ -42,30 +52,36 @@ description: >-
 python3 scripts/inquiry.py submit "<商品链接或ID>" "<询盘问题>" [--quantity X] [--address "地址"]
 ```
 
-从响应中提取 `result.data` 作为 taskId。提交成功后立即告知用户：
+从响应中提取 `result.data` 作为 taskId。
 
-> 询盘已发送给供应商，正在等待回复（最多20分钟），有结果会自动通知你 ✅
+## Step 3: 等待结果（按 channel 区分）
 
-## Step 3: sessions_spawn 异步轮询
+### 方案 A：webchat — 当前 session 同步轮询
+
+直接在当前 session 中运行 poll 命令，阻塞等待结果：
+
+```bash
+python3 /home/admin/.openclaw/workspace/skills/inquiry-1688/scripts/inquiry.py poll "{taskId}"
+```
+
+提交后先告知用户：
+> 询盘已发送，正在等供应商回复，大概需要几分钟，请稍等... ⏳
+
+poll 命令会每30秒查一次，最多等20分钟。结果出来后**直接在当前会话回复用户**，不会丢。
+
+### 方案 B：外部 channel（钉钉/Telegram/Discord 等）— sessions_spawn 异步 + message 推送
 
 使用 `sessions_spawn` 启动子agent后台轮询。
 
 **调用参数：**
 - **task**: 轮询指令（见下方模板）
-- **runTimeoutSeconds**: `1400`（略大于20分钟轮询 + 60秒初始等待）
-- **label**: `inquiry-poll-{商品ID}`（便于追踪）
+- **runTimeoutSeconds**: `1400`
+- **label**: `inquiry-poll-{商品ID}`
 
-### 结果推送策略（按 channel 区分）
-
-| 当前 channel | 推送方式 | 说明 |
-|-------------|---------|------|
-| **webchat** | announce（默认） | webchat 不支持 message 主动推送，子agent 完成后自动 announce 回主 session，用户在下一次对话交互时看到结果 |
-| **dingtalk / telegram / discord 等外部 channel** | 在 task 中指示子agent 用 `message` 工具主动推送 | 外部 channel 支持 message 主动推送，在 task 模板末尾追加推送指令（见下方"外部 channel 推送指令"） |
-
-### task 模板（通用部分）：
+**task 模板：**
 
 ```
-请轮询1688询盘任务结果并总结。
+请轮询1688询盘任务结果并总结，然后主动推送给用户。
 
 执行步骤：
 1. 先等待60秒（给询盘初始处理时间）：
@@ -97,40 +113,36 @@ python3 scripts/inquiry.py submit "<商品链接或ID>" "<询盘问题>" [--quan
 - 进度: {progress}
 - 回复详情: {inquiryAnswers}
 
-5. 如果超时仍未完成，说明当前进度，告知用户可稍后手动查询。
+5. 如果超时仍未完成，说明当前进度。
+
+6. 总结完成后，使用 message 工具主动推送结果给用户：
+   message action=send, channel={channel}, target={target}, message="{总结内容}"
 
 原始信息：
 - 任务ID: {taskId}
 - 商品链接: {链接}
 - 询盘问题: {用户的问题}
+- 推送 channel: {channel}
+- 推送 target: {target}
 ```
 
-### 外部 channel 推送指令（追加到 task 末尾）：
+## 结果展示格式
 
-当用户来自外部 channel 时，在 task 模板末尾追加以下内容：
+拿到 poll/query 的 JSON 结果后，按以下格式总结回复：
 
-```
-6. 总结完成后，使用 message 工具主动推送结果给用户：
-   message action=send, channel={channel}, target={target}, message="{总结内容}"
-   
-   推送信息：
-   - channel: {当前channel，如 dingtalk}
-   - target: {用户ID或会话ID}
-```
+### 📋 询盘结果
 
-⚠️ **webchat 不支持此推送方式**，webchat 场景不要追加此指令。
+**商品**: {taskInfo.title 或商品名称}（¥{价格}）
+**供应商**: {sellerInfo.companyName}
+**状态**: ✅/❌ {taskInfo.status}
 
-### 为什么用 sessions_spawn 而不是 cron？
+| 问题 | 回复 |
+|------|------|
+| {问题1} | {回答1} |
+| {问题2} | {回答2} |
 
-> **教训记录（2026-03-05 ~ 03-06）：** 之前用 cron isolated session 方案连续失败三次：
-> 1. delivery 没配 channel → 报错 "cron delivery target is missing"
-> 2. 手算 UTC 时间算错 → 任务延迟 1 小时才触发
-> 3. 时间和 channel 都对了，但 announce 仍未送达
->
-> `sessions_spawn` 的优势：
-> - **自动 announce 回发起者会话**，无需手动配置 delivery channel
-> - **立即启动**，无需计算触发时间
-> - **更简单可靠**，少了 cron 调度这一层中间环节
+#### AI 总结
+{aiSummary 核心内容，精简展示}
 
 ## 脚本命令参考
 
@@ -144,8 +156,14 @@ python3 scripts/inquiry.py submit "<商品链接或ID>" "<询盘问题>" [--quan
 
 - `questionList` 固定填 `["自定义"]`，用户实际问题放入 `requirementContent`
 - `isRequirementOriginal` 设为 `true`，原文发送
-- poll 命令会阻塞最多20分钟，必须在子agent session 中运行（通过 sessions_spawn）
-- `runTimeoutSeconds` 设为 1400 以确保轮询不被截断（60秒等待 + 1200秒轮询 + 余量）
+- **webchat 必须用同步轮询（方案A）**，不要用 sessions_spawn！webchat 不支持 message 主动推送，announce 也不会主动通知用户（教训：2026-03-06 连续多次 announce 结果用户收不到）
+- 外部 channel 用异步轮询（方案B），通过 message 工具主动推送结果
 - 如果需要手动查询结果，可直接运行 `inquiry.py query "{taskId}"`
-- ⚠️ **webchat 不支持 message 主动推送**（教训：2026-03-06 测试确认），只能通过 announce 回传
-- 外部 channel（dingtalk 等）支持 message 主动推送，应在 task 中指示子agent 完成后直接推送
+
+## 教训记录
+
+> **2026-03-05 ~ 03-06 连续踩坑：**
+> 1. ❌ cron + delivery 方案：delivery 没配 channel → 报错；手算 UTC 时间错 → 延迟触发；配置都对了 announce 仍不送达
+> 2. ❌ sessions_spawn + announce 方案：子agent 跑完了但用户看不到结果，必须用户主动发消息才能触发
+> 3. ❌ sessions_spawn + message 推送 webchat：webchat 不是 channel plugin，不支持 message 推送
+> 4. ✅ **最终方案**：webchat 用同步轮询直接回复；外部 channel 用 sessions_spawn + message 主动推送
