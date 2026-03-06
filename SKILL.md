@@ -67,20 +67,31 @@ python3 scripts/inquiry.py submit "<商品链接或ID>" "<询盘问题>" [--quan
 
 **正确做法：agent 自己循环调用 `query` 命令**。
 
+⚠️ **实现关键：必须用 `exec` 的 `timeout` 参数控制等待，不要用 `process poll` 轮询输出！**
+`process poll` 每次调用有延迟，反复 poll 会导致一轮循环实际耗时远超预期（教训：2026-03-06 一轮循环实际耗时 2-3 分钟而非 60 秒，8 轮下来超过 20 分钟）。
+
 ```
-循环逻辑：
-1. submit 后先等 60 秒
-2. 运行 query：python3 scripts/inquiry.py query "{taskId}"
-3. 检查 taskInfo.status：
-   - FINISHED / FAILED / CANCELED → 结束，立即总结回复
-   - RUNNING → 等 60 秒，再次 query
-4. 如果已经循环超过 20 分钟 → 做最后一次 query，用结果回复
-   （因为 API 端任务最多执行 20 分钟，此时一定有最终结果）
+循环逻辑（最多 20 轮，每轮 60 秒，共 20 分钟）：
+
+queryCount = 0
+
+循环开始：
+1. 运行命令（sleep + query 合并为一条 exec）：
+   exec command="sleep 60 && python3 scripts/inquiry.py query '{taskId}'"  timeout=90
+   
+   ⚠️ 直接等 exec 返回，不要用 process poll！设 timeout=90 足够覆盖 60s sleep + query 时间。
+
+2. queryCount += 1
+3. 解析 JSON，检查 taskInfo.status：
+   - FINISHED / FAILED / CANCELED → 结束循环，立即总结回复用户
+   - RUNNING 且 queryCount < 20 → 回到步骤 1
+   - RUNNING 且 queryCount >= 20 → 用当前结果回复用户（20 分钟到了，API 端任务一定已结束）
 ```
 
 **关键规则：**
-- 每次 query 间隔 **60 秒**（不用太频繁，大部分供应商需要几分钟）
-- **20 分钟是硬上限**，到了必须回复，不管什么状态
+- 每次 query 间隔 **60 秒**（sleep 60 包含在 exec 命令中）
+- **最多循环 20 次**（20 × 60秒 = 20 分钟），到了必须回复
+- **不要用 `process poll` 等输出**，直接用 exec timeout 等命令完成
 - 大多数询盘 2-5 分钟就能完成，少数供应商不回复才会等到 20 分钟
 
 提交后先告知用户：
@@ -187,4 +198,5 @@ python3 scripts/inquiry.py submit "<商品链接或ID>" "<询盘问题>" [--quan
 > 3. ❌ sessions_spawn + message 推送 webchat：webchat 不是 channel plugin，不支持 message 推送
 > 4. ❌ webchat 同步 poll 方案：poll 阻塞进程，stdout 无中间输出，agent 无法给用户报进度，且 agent 容易提前放弃等待
 > 5. ❌ webchat 循环 query 但无上限：agent 在循环里卡了10多分钟不给用户回复
-> 6. ✅ **最终方案**：webchat 用 agent 循环 query（每60秒一次，20分钟硬上限兜底）；外部 channel 用 sessions_spawn + message 主动推送
+> 6. ❌ webchat 循环 query 但用 process poll 等输出：每轮 poll 有延迟，实际一轮耗时 2-3 分钟而非 60 秒，8 轮超过 20 分钟
+> 7. ✅ **最终方案**：webchat 用 agent 循环 query，exec timeout 等命令完成（不用 process poll），每轮严格 60 秒，最多 20 轮；外部 channel 用 sessions_spawn + message 主动推送
