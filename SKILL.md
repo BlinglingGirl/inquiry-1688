@@ -3,7 +3,7 @@ name: inquiry-1688
 description: >-
   向1688供应商发起询盘，获取供应商对商品问题的回复。用户提供1688商品链接和自由文本问题，
   skill自动发起询盘任务，通过sessions_spawn异步轮询结果（每30秒，最多20分钟），
-  获取到回复后自动announce回主session。
+  获取到回复后自动announce回主session或通过message主动推送。
   触发词：询盘、问供应商、问商家、咨询供应商、1688询盘、能不能定制、起批量多少、
   商品长宽高、是否可以发货、是否有资质、供应商能不能XXX。
 ---
@@ -23,7 +23,7 @@ description: >-
          ↓
 4. 子agent 运行 poll 命令 → 每30秒查一次，最多20分钟
          ↓
-5. 子agent 完成后自动 announce 回主 session → 用户看到结果
+5. 结果回传（按 channel 区分，见 Step 3）
 ```
 
 ## Step 1: 提取信息
@@ -48,14 +48,21 @@ python3 scripts/inquiry.py submit "<商品链接或ID>" "<询盘问题>" [--quan
 
 ## Step 3: sessions_spawn 异步轮询
 
-使用 `sessions_spawn` 启动子agent后台轮询，结果自动 announce 回当前会话。
+使用 `sessions_spawn` 启动子agent后台轮询。
 
 **调用参数：**
 - **task**: 轮询指令（见下方模板）
 - **runTimeoutSeconds**: `1400`（略大于20分钟轮询 + 60秒初始等待）
 - **label**: `inquiry-poll-{商品ID}`（便于追踪）
 
-**task 模板：**
+### 结果推送策略（按 channel 区分）
+
+| 当前 channel | 推送方式 | 说明 |
+|-------------|---------|------|
+| **webchat** | announce（默认） | webchat 不支持 message 主动推送，子agent 完成后自动 announce 回主 session，用户在下一次对话交互时看到结果 |
+| **dingtalk / telegram / discord 等外部 channel** | 在 task 中指示子agent 用 `message` 工具主动推送 | 外部 channel 支持 message 主动推送，在 task 模板末尾追加推送指令（见下方"外部 channel 推送指令"） |
+
+### task 模板（通用部分）：
 
 ```
 请轮询1688询盘任务结果并总结。
@@ -98,6 +105,21 @@ python3 scripts/inquiry.py submit "<商品链接或ID>" "<询盘问题>" [--quan
 - 询盘问题: {用户的问题}
 ```
 
+### 外部 channel 推送指令（追加到 task 末尾）：
+
+当用户来自外部 channel 时，在 task 模板末尾追加以下内容：
+
+```
+6. 总结完成后，使用 message 工具主动推送结果给用户：
+   message action=send, channel={channel}, target={target}, message="{总结内容}"
+   
+   推送信息：
+   - channel: {当前channel，如 dingtalk}
+   - target: {用户ID或会话ID}
+```
+
+⚠️ **webchat 不支持此推送方式**，webchat 场景不要追加此指令。
+
 ### 为什么用 sessions_spawn 而不是 cron？
 
 > **教训记录（2026-03-05 ~ 03-06）：** 之前用 cron isolated session 方案连续失败三次：
@@ -125,3 +147,5 @@ python3 scripts/inquiry.py submit "<商品链接或ID>" "<询盘问题>" [--quan
 - poll 命令会阻塞最多20分钟，必须在子agent session 中运行（通过 sessions_spawn）
 - `runTimeoutSeconds` 设为 1400 以确保轮询不被截断（60秒等待 + 1200秒轮询 + 余量）
 - 如果需要手动查询结果，可直接运行 `inquiry.py query "{taskId}"`
+- ⚠️ **webchat 不支持 message 主动推送**（教训：2026-03-06 测试确认），只能通过 announce 回传
+- 外部 channel（dingtalk 等）支持 message 主动推送，应在 task 中指示子agent 完成后直接推送
