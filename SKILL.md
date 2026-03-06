@@ -3,7 +3,8 @@ name: inquiry-1688
 description: >-
   向1688供应商发起询盘，获取供应商对商品问题的回复。用户提供1688商品链接和自由文本问题，
   skill自动发起询盘任务，等待供应商回复后总结结果。
-  webchat场景在当前session用query循环轮询；外部channel（钉钉等）用sessions_spawn异步轮询+message主动推送。
+  询盘任务最多执行20分钟，到时间后一定有最终结果。
+  webchat场景在当前session循环query；外部channel（钉钉等）用sessions_spawn异步轮询+message主动推送。
   触发词：询盘、问供应商、问商家、咨询供应商、1688询盘、能不能定制、起批量多少、
   商品长宽高、是否可以发货、是否有资质、供应商能不能XXX。
 ---
@@ -11,6 +12,8 @@ description: >-
 # 1688 询盘
 
 向1688供应商发起询盘，等待结果，自动总结回复。
+
+**核心机制**：询盘任务提交后，API 端最多执行 20 分钟，到时间后任务状态一定会变为 FINISHED/FAILED/CANCELED。所以 **20 分钟后 query 一次，一定能拿到最终结果**。
 
 ## 工作流程（按 channel 区分）
 
@@ -20,11 +23,11 @@ description: >-
          ↓
 2. submit 提交询盘 → 获取 taskId → 告知用户"已发起，正在等待"
          ↓
-3. agent 自己循环调用 query 命令（每30-60秒查一次，最多20分钟）
-   - 每次 query 检查 taskInfo.status 是否为 FINISHED/FAILED/CANCELED
-   - 可以中途给用户报进度（如"供应商已读，正在回复..."）
+3. agent 循环 query（每60秒查一次）
+   - 任务完成 → 立即回复
+   - 未完成但已过20分钟 → query 最后一次，用最终结果回复
          ↓
-4. 结果出来后直接回复用户
+4. 直接回复用户
 ```
 
 ### 外部 channel 场景（钉钉/Telegram/Discord 等，异步推送）
@@ -33,9 +36,9 @@ description: >-
          ↓
 2. submit 提交询盘 → 获取 taskId → 告知用户"已发起，有结果会通知你"
          ↓
-3. sessions_spawn 启动子agent → 后台轮询
+3. sessions_spawn 启动子agent → 后台 poll（最多20分钟自动结束）
          ↓
-4. 子agent poll 拿到结果后，用 message 工具主动推送给用户
+4. 子agent 拿到结果后，用 message 工具主动推送给用户
 ```
 
 ## Step 1: 提取信息
@@ -60,35 +63,28 @@ python3 scripts/inquiry.py submit "<商品链接或ID>" "<询盘问题>" [--quan
 
 ### 方案 A：webchat — agent 自己循环 query
 
-⚠️ **不要用 `poll` 命令！** poll 会阻塞进程最多20分钟，期间 stdout 无输出，agent 无法给用户反馈进度，体验极差。
+⚠️ **不要用 `poll` 命令！** poll 会阻塞进程，agent 无法控制节奏。
 
-**正确做法：agent 自己循环调用 `query` 命令**，每次查完判断状态。
-
-⚠️ **必须严格控制循环次数和超时，禁止无限等待！**
+**正确做法：agent 自己循环调用 `query` 命令**。
 
 ```
-循环逻辑（agent 自己控制）：
-
-前置：记录 queryCount = 0，maxQueries = 10（约5-6分钟，含初始等待）
-
-1. submit 后先等 60 秒（exec sleep 60）
-2. queryCount += 1
-3. 运行 query：
-   python3 scripts/inquiry.py query "{taskId}"
-4. 检查 taskInfo.status：
-   - FINISHED / FAILED / CANCELED → ✅ 结束循环，立即总结回复用户
-   - RUNNING 且 queryCount >= maxQueries → ⏰ 超时，用最后结果回复用户
-   - RUNNING 且 queryCount < maxQueries → 等 30 秒，回到步骤 2
+循环逻辑：
+1. submit 后先等 60 秒
+2. 运行 query：python3 scripts/inquiry.py query "{taskId}"
+3. 检查 taskInfo.status：
+   - FINISHED / FAILED / CANCELED → 结束，立即总结回复
+   - RUNNING → 等 60 秒，再次 query
+4. 如果已经循环超过 20 分钟 → 做最后一次 query，用结果回复
+   （因为 API 端任务最多执行 20 分钟，此时一定有最终结果）
 ```
 
 **关键规则：**
-- **最多 query 10 次**（60s 初始等待 + 10×30s = 约 6 分钟），不要等满 20 分钟！
-- **每次 query 后必须检查 queryCount**，到了上限立即回复，不管状态
-- 超时回复时说明"供应商尚未完全回复，当前进度 XX%"
-- 不要在循环中间给用户发进度消息（浪费轮次），集中精力等结果
+- 每次 query 间隔 **60 秒**（不用太频繁，大部分供应商需要几分钟）
+- **20 分钟是硬上限**，到了必须回复，不管什么状态
+- 大多数询盘 2-5 分钟就能完成，少数供应商不回复才会等到 20 分钟
 
 提交后先告知用户：
-> 询盘已发送，正在等供应商回复，大概需要几分钟，请稍等... ⏳
+> 询盘已发送，正在等供应商回复，快的话几分钟，最多20分钟，请稍等... ⏳
 
 ### 方案 B：外部 channel（钉钉/Telegram/Discord 等）— sessions_spawn 异步 + message 推送
 
@@ -177,18 +173,18 @@ python3 scripts/inquiry.py submit "<商品链接或ID>" "<询盘问题>" [--quan
 
 - `questionList` 固定填 `["自定义"]`，用户实际问题放入 `requirementContent`
 - `isRequirementOriginal` 设为 `true`，原文发送
-- **webchat 必须用 agent 自己循环 query（方案A）**，不要用 poll 阻塞命令，也不要用 sessions_spawn
+- **webchat 用 agent 自己循环 query（方案A）**，不要用 poll 阻塞命令
 - 外部 channel 用 sessions_spawn 异步轮询（方案B），通过 message 工具主动推送结果
 - 如果需要手动查询结果，可直接运行 `inquiry.py query "{taskId}"`
-- **query 循环最多 10 次（约6分钟）**，超时后立即用最后结果回复用户，说明供应商尚未完成回复
-- ⚠️ **禁止无限循环等待！** 必须用 queryCount 计数器控制退出（教训：2026-03-06 agent 在循环里卡了10多分钟没给用户回复）
+- **询盘任务 API 端最多执行 20 分钟**，到时间后一定有最终结果，所以 20 分钟后 query 一次即可兜底
+- ⚠️ **20 分钟是硬上限，到了必须回复用户**，不管供应商有没有回完
 
 ## 教训记录
 
 > **2026-03-05 ~ 03-06 连续踩坑：**
 > 1. ❌ cron + delivery 方案：delivery 没配 channel → 报错；手算 UTC 时间错 → 延迟触发；配置都对了 announce 仍不送达
-> 2. ❌ sessions_spawn + announce 方案：子agent 跑完了但用户看不到结果，必须用户主动发消息才能触发
+> 2. ❌ sessions_spawn + announce 方案：子agent 跑完了但用户看不到结果，必须用户主动发消息才能触发（且 announce 延迟不可控，有过延迟3小时的情况）
 > 3. ❌ sessions_spawn + message 推送 webchat：webchat 不是 channel plugin，不支持 message 推送
 > 4. ❌ webchat 同步 poll 方案：poll 阻塞进程，stdout 无中间输出，agent 无法给用户报进度，且 agent 容易提前放弃等待
-> 5. ❌ webchat 循环 query 但无上限：agent 在循环里卡了10多分钟不给用户回复，跟没回一样
-> 6. ✅ **最终方案**：webchat 用 agent 循环 query + 严格 10 次上限（约6分钟）；外部 channel 用 sessions_spawn + message 主动推送
+> 5. ❌ webchat 循环 query 但无上限：agent 在循环里卡了10多分钟不给用户回复
+> 6. ✅ **最终方案**：webchat 用 agent 循环 query（每60秒一次，20分钟硬上限兜底）；外部 channel 用 sessions_spawn + message 主动推送
