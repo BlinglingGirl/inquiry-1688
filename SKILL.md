@@ -50,9 +50,18 @@ python3 scripts/inquiry.py submit "<商品链接或ID>" "<询盘问题>" [--quan
 
 使用 cron 创建一次性任务，**1分钟后触发**（给询盘一点初始处理时间）：
 
+⚠️ **时间计算必须用 `date` 命令获取准确的 UTC ISO-8601 时间，禁止手动心算！**
+```bash
+# 获取1分钟后的 UTC ISO-8601 时间戳（用于 cron schedule.at）
+date -u -d '+1 minute' --iso-8601=seconds
+```
+
+- **schedule.kind**: `at`
+- **schedule.at**: 上面命令输出的 UTC 时间戳
 - **sessionTarget**: `isolated`
 - **payload.kind**: `agentTurn`
 - **payload.timeoutSeconds**: `1300`（略大于20分钟轮询时间）
+- **delivery.channel**: 必须填写当前会话的 channel（如 `webchat`、`dingtalk` 等），否则结果无法送达！
 
 cron message 模板：
 
@@ -108,3 +117,5 @@ cron message 模板：
 - `isRequirementOriginal` 设为 `true`，原文发送
 - poll 命令会阻塞最多20分钟，必须在 isolated session 中运行
 - cron payload 的 `timeoutSeconds` 设为 1300 以确保轮询不被截断
+- ⚠️ **cron 时间必须用 `date -u -d '+1 minute' --iso-8601=seconds` 计算，禁止手动心算 UTC 时间！**（教训：2026-03-06 手算 UTC 偏移导致任务延迟 1 小时才触发）
+- ⚠️ **delivery 必须配置 channel**（如 `webchat`、`dingtalk`），否则 isolated session 跑完结果无法送达！（教训：2026-03-05 delivery 缺少 channel 导致报错 "cron delivery target is missing"）
