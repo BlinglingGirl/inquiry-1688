@@ -5,6 +5,13 @@ description: >-
   skill自动发起询盘任务，20分钟后通过cron systemEvent触发主session查询结果并回复用户。
   触发词：询盘、问供应商、问商家、咨询供应商、1688询盘、能不能定制、起批量多少、
   商品长宽高、是否可以发货、是否有资质、供应商能不能XXX。
+metadata:
+  openclaw:
+    primaryEnv: ALPHASHOP_ACCESS_KEY, ALPHASHOP_SECRET_KEY
+    requires:
+      env:
+        - ALPHASHOP_ACCESS_KEY
+        - ALPHASHOP_SECRET_KEY
 ---
 
 # 1688 询盘
