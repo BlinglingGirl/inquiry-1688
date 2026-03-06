@@ -3,7 +3,7 @@ name: inquiry-1688
 description: >-
   向1688供应商发起询盘，获取供应商对商品问题的回复。用户提供1688商品链接和自由文本问题，
   skill自动发起询盘任务，等待供应商回复后总结结果。
-  webchat场景在当前session同步轮询；外部channel（钉钉等）用sessions_spawn异步轮询+message主动推送。
+  webchat场景在当前session用query循环轮询；外部channel（钉钉等）用sessions_spawn异步轮询+message主动推送。
   触发词：询盘、问供应商、问商家、咨询供应商、1688询盘、能不能定制、起批量多少、
   商品长宽高、是否可以发货、是否有资质、供应商能不能XXX。
 ---
@@ -14,13 +14,15 @@ description: >-
 
 ## 工作流程（按 channel 区分）
 
-### webchat 场景（同步轮询）
+### webchat 场景（agent 自己循环 query）
 ```
 1. 提取：1688商品链接 + 询盘问题
          ↓
 2. submit 提交询盘 → 获取 taskId → 告知用户"已发起，正在等待"
          ↓
-3. 当前 session 直接运行 poll 命令（每30秒查一次，最多20分钟）
+3. agent 自己循环调用 query 命令（每30-60秒查一次，最多20分钟）
+   - 每次 query 检查 taskInfo.status 是否为 FINISHED/FAILED/CANCELED
+   - 可以中途给用户报进度（如"供应商已读，正在回复..."）
          ↓
 4. 结果出来后直接回复用户
 ```
@@ -56,18 +58,28 @@ python3 scripts/inquiry.py submit "<商品链接或ID>" "<询盘问题>" [--quan
 
 ## Step 3: 等待结果（按 channel 区分）
 
-### 方案 A：webchat — 当前 session 同步轮询
+### 方案 A：webchat — agent 自己循环 query
 
-直接在当前 session 中运行 poll 命令，阻塞等待结果：
+⚠️ **不要用 `poll` 命令！** poll 会阻塞进程最多20分钟，期间 stdout 无输出，agent 无法给用户反馈进度，体验极差。
 
-```bash
-python3 /home/admin/.openclaw/workspace/skills/inquiry-1688/scripts/inquiry.py poll "{taskId}"
+**正确做法：agent 自己循环调用 `query` 命令**，每次查完判断状态：
+
 ```
+循环逻辑（agent 自己控制）：
+1. submit 后先等 60 秒（exec sleep 60）
+2. 运行 query：
+   python3 scripts/inquiry.py query "{taskId}"
+3. 检查 taskInfo.status：
+   - FINISHED / FAILED / CANCELED → 结束循环，总结回复
+   - RUNNING → 等 30 秒后再次 query
+4. 最多循环 20 分钟（约 24 次 query），超时后用最后一次 query 的结果回复
+```
+
+每次 query 都能拿到最新的聊天记录和进度，agent 可以中途给用户报进度，比如：
+> 供应商已回复了部分问题，还在继续聊，再等等... ⏳
 
 提交后先告知用户：
 > 询盘已发送，正在等供应商回复，大概需要几分钟，请稍等... ⏳
-
-poll 命令会每30秒查一次，最多等20分钟。结果出来后**直接在当前会话回复用户**，不会丢。
 
 ### 方案 B：外部 channel（钉钉/Telegram/Discord 等）— sessions_spawn 异步 + message 推送
 
@@ -128,7 +140,7 @@ poll 命令会每30秒查一次，最多等20分钟。结果出来后**直接在
 
 ## 结果展示格式
 
-拿到 poll/query 的 JSON 结果后，按以下格式总结回复：
+拿到 query 的 JSON 结果后，按以下格式总结回复：
 
 ### 📋 询盘结果
 
@@ -150,15 +162,16 @@ poll 命令会每30秒查一次，最多等20分钟。结果出来后**直接在
 |------|------|------|
 | `submit` | 提交询盘 | `inquiry.py submit "链接" "问题"` |
 | `query` | 单次查询 | `inquiry.py query "taskId"` |
-| `poll` | 轮询等结果 | `inquiry.py poll "taskId"` |
+| `poll` | 轮询等结果（仅用于 sessions_spawn 子agent） | `inquiry.py poll "taskId"` |
 
 ## 注意事项
 
 - `questionList` 固定填 `["自定义"]`，用户实际问题放入 `requirementContent`
 - `isRequirementOriginal` 设为 `true`，原文发送
-- **webchat 必须用同步轮询（方案A）**，不要用 sessions_spawn！webchat 不支持 message 主动推送，announce 也不会主动通知用户（教训：2026-03-06 连续多次 announce 结果用户收不到）
-- 外部 channel 用异步轮询（方案B），通过 message 工具主动推送结果
+- **webchat 必须用 agent 自己循环 query（方案A）**，不要用 poll 阻塞命令，也不要用 sessions_spawn
+- 外部 channel 用 sessions_spawn 异步轮询（方案B），通过 message 工具主动推送结果
 - 如果需要手动查询结果，可直接运行 `inquiry.py query "{taskId}"`
+- query 循环最多 20 分钟，超时后用最后一次结果回复用户，说明供应商尚未完成回复
 
 ## 教训记录
 
@@ -166,4 +179,5 @@ poll 命令会每30秒查一次，最多等20分钟。结果出来后**直接在
 > 1. ❌ cron + delivery 方案：delivery 没配 channel → 报错；手算 UTC 时间错 → 延迟触发；配置都对了 announce 仍不送达
 > 2. ❌ sessions_spawn + announce 方案：子agent 跑完了但用户看不到结果，必须用户主动发消息才能触发
 > 3. ❌ sessions_spawn + message 推送 webchat：webchat 不是 channel plugin，不支持 message 推送
-> 4. ✅ **最终方案**：webchat 用同步轮询直接回复；外部 channel 用 sessions_spawn + message 主动推送
+> 4. ❌ webchat 同步 poll 方案：poll 阻塞进程，stdout 无中间输出，agent 无法给用户报进度，且 agent 容易提前放弃等待
+> 5. ✅ **最终方案**：webchat 用 agent 自己循环 query（可报进度、可控制节奏）；外部 channel 用 sessions_spawn + message 主动推送
