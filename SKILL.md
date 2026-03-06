@@ -75,7 +75,8 @@ job={
     "kind": "systemEvent",
     "text": "🔔 询盘提醒：任务 {taskId} 已到20分钟，请立即查询结果并回复用户。\n\n请执行：\npython3 /home/admin/.openclaw/workspace/skills/inquiry-1688/scripts/inquiry.py query \"{taskId}\"\n\n查询后按以下格式总结回复用户：\n\n商品链接: {链接}\n询盘问题: {用户的问题}"
   },
-  "deleteAfterRun": true
+  "deleteAfterRun": true,
+  "wakeMode": "now"
 }
 ```
 
@@ -122,6 +123,7 @@ python3 scripts/inquiry.py query "{taskId}"
 - **不要轮询！** submit 后创建 cron，20 分钟后 query 一次就够
 - cron 用 `sessionTarget: main` + `payload.kind: systemEvent`，直接注入主 session
 - 时间计算必须用 `date -u -d '+20 minutes' --iso-8601=seconds`
+- ⚠️ **cron 必须设置 `wakeMode: now`**，否则 systemEvent 要等心跳才处理，用户等不到结果（教训：2026-03-06 默认 next-heartbeat 导致 systemEvent 没被及时处理）
 - 如果用户中途问"结果出来了吗"，可以提前 query 一次看看
 
 ## 教训记录
@@ -133,4 +135,5 @@ python3 scripts/inquiry.py query "{taskId}"
 > 4. ❌ 同步 poll：阻塞进程，无中间输出
 > 5. ❌ 循环 query：process poll 延迟导致超时 / yieldMs 超系统上限被后台化
 > 6. ❌ sleep 1200 同步等：yieldMs 超系统上限，exec 被后台化，结果拿不回来
-> 7. ✅ **最终方案**：submit → cron systemEvent（20分钟后注入主session）→ agent 收到后 query 一次 → 直接回复用户
+> 7. ❌ cron systemEvent + wakeMode 默认（next-heartbeat）：systemEvent 注入了但要等心跳才处理，用户等不到结果
+> 8. ✅ **最终方案**：submit → cron systemEvent（20分钟后注入主session，wakeMode=now 立即唤醒）→ agent 收到后 query 一次 → 直接回复用户
