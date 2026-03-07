@@ -18,23 +18,26 @@ metadata:
 
 向1688供应商发起询盘，20分钟后自动查询结果并回复。
 
-**核心机制**：询盘任务提交后，API 端最多执行 20 分钟，到时间后任务一定结束。通过 cron 在 20 分钟后向主 session 注入 systemEvent，触发 agent 查询结果并回复用户。
+**核心机制**：询盘任务提交后，API 端最多执行 20 分钟，到时间后任务一定结束。通过 cron 在 20 分钟后查询结果并写入文件，用户下次发消息时 agent 检查文件并回复。
 
 ## 工作流程
 
 ```
 1. 提取：1688商品链接 + 询盘问题
          ↓
-2. submit 提交询盘 → 获取 taskId → 告知用户"已发起，20分钟后给你结果"
+2. submit 提交询盘 → 获取 taskId → 告知用户"已发起，20分钟后结果就绪"
          ↓
-3. 记录用户当前 session key（从 runtime 或 sessions_list 获取）
+3. 写入追踪文件 pending_inquiries.json
          ↓
 4. 用 date 命令计算 20 分钟后的 UTC 时间
          ↓
 5. 创建 cron isolated agentTurn 任务
-   任务内容：查询结果 + 用 sessions_send 发到用户 session
+   任务内容：查询结果 → 写入 results/{taskId}.md → 清除 pending 记录
          ↓
-6. 20 分钟后 cron 触发 → isolated session 查询结果 → sessions_send 发给用户
+6. 20 分钟后 cron 触发 → isolated session 查询结果 → 写入文件
+         ↓
+7. 用户下次发消息时 → agent 检查 results/ 目录 → 发现结果 → 直接回复
+   （心跳也会兜底检查 pending_inquiries.json 中超时未处理的任务）
 ```
 
 ## Step 1: 提取信息
@@ -56,27 +59,20 @@ python3 scripts/inquiry.py submit "<商品链接或ID>" "<询盘问题>" [--quan
 从响应中提取 `result.data` 作为 taskId。提交成功后告知用户：
 > 询盘已发送给供应商，20分钟后给你结果 ✅
 
-## Step 3: 获取用户 session key + 写入追踪文件 + 创建 cron 任务
+## Step 3: 写入追踪文件 + 创建 cron 查询任务
 
-### 3a: 获取用户当前 session key
+### 3a: 写入追踪文件
 
-在当前对话中，通过 `sessions_list` 找到当前用户的 webchat session key。
-session key 格式通常为 `agent:main:openresponses-user:XXXXXX`。
-
-**⚠️ 必须在提交询盘时就记录 session key，因为后续 cron 要用它发送结果。**
-
-### 3b: 写入追踪文件（兜底机制）
-
-将待查询的任务信息追加到追踪文件，用于心跳兜底检查：
+将待查询的任务信息追加到追踪文件：
 
 ```bash
 TRACK_FILE="/home/admin/.openclaw/workspace/skills/inquiry-1688/pending_inquiries.json"
 
 # 写入格式（JSON Lines，每行一个任务）：
-echo '{"taskId":"<taskId>","productId":"<商品ID>","url":"<商品链接>","question":"<用户问题>","submitTime":"<ISO时间>","sessionKey":"<用户session key>"}' >> "$TRACK_FILE"
+echo '{"taskId":"<taskId>","productId":"<商品ID>","url":"<商品链接>","question":"<用户问题>","submitTime":"<ISO时间>"}' >> "$TRACK_FILE"
 ```
 
-### 3c: 创建 cron isolated agentTurn 任务
+### 3b: 创建 cron 查询任务（写结果到文件）
 
 ⚠️ **时间计算必须用 `date` 命令，禁止手算！**
 
@@ -84,7 +80,7 @@ echo '{"taskId":"<taskId>","productId":"<商品ID>","url":"<商品链接>","ques
 date -u -d '+20 minutes' --iso-8601=seconds
 ```
 
-然后创建 cron 任务：
+然后创建 cron 任务。**核心变化：不再用 sessions_send 推送，而是把结果写到文件**：
 
 ```
 cron action=add
@@ -94,32 +90,37 @@ job={
   "sessionTarget": "isolated",
   "payload": {
     "kind": "agentTurn",
-    "message": "你是询盘结果查询助手。请严格执行以下步骤：\n\n1. 执行查询命令：\npython3 /home/admin/.openclaw/workspace/skills/inquiry-1688/scripts/inquiry.py query \"{taskId}\"\n\n2. 将结果总结为以下格式：\n   📋 询盘结果\n   商品链接: {链接}\n   用户原始问题: {用户的问题}\n   商品名称 + 价格\n   供应商名称\n   各问题的回答（用表格）\n\n3. 用 sessions_send 工具把总结结果发到用户 session：\n   sessionKey: \"{用户session key}\"\n   message: （上面总结好的结果）\n\n4. 发送后，清除追踪记录：\npython3 /home/admin/.openclaw/workspace/skills/inquiry-1688/scripts/inquiry.py remove-pending \"{taskId}\"\n\n⚠️ 必须用 sessions_send 发送！不要只是回复当前 session！",
+    "message": "你是询盘结果查询助手。请严格执行以下步骤：\n\n1. 执行查询命令：\npython3 /home/admin/.openclaw/workspace/skills/inquiry-1688/scripts/inquiry.py query \"{taskId}\"\n\n2. 将结果总结为 markdown 格式（中文），包含：\n   📋 询盘结果\n   商品链接: {链接}\n   用户原始问题: {用户的问题}\n   商品名称 + 价格 + 供应商名称\n   各问题的回答（用表格：问题 | 回复）\n   AI 总结\n\n3. 把总结好的 markdown 写入结果文件：\n   文件路径: /home/admin/.openclaw/workspace/skills/inquiry-1688/results/{taskId}.md\n   如果 results 目录不存在先创建\n\n4. 清除追踪记录：\npython3 /home/admin/.openclaw/workspace/skills/inquiry-1688/scripts/inquiry.py remove-pending \"{taskId}\"\n\n⚠️ 只需要写文件！不要用 sessions_send，不要尝试发消息给用户！",
     "timeoutSeconds": 120
   },
   "delivery": {
     "mode": "none"
   },
-  "deleteAfterRun": true,
-  "wakeMode": "now"
+  "enabled": true
 }
 ```
 
 **关键参数：**
 - **sessionTarget**: `isolated`（独立 session 执行，不抢主 session 锁）
 - **payload.kind**: `agentTurn`（独立 agent turn）
-- **delivery.mode**: `none`（不走 announce，由 agentTurn 内部用 sessions_send 推送）
-- **deleteAfterRun**: `true`（一次性任务）
+- **delivery.mode**: `none`（不走 announce）
+- cron 只负责查询 + 写文件，不负责推送
 
-## Step 4: isolated session 查询并推送结果
+## Step 4: 结果投递（被动模式）
 
-20 分钟后 cron 触发 isolated agentTurn，该 session 会：
-1. 执行 `inquiry.py query` 获取结果
-2. 总结结果
-3. 用 `sessions_send(sessionKey, message)` 推送到用户 session
-4. 执行 `inquiry.py remove-pending` 清除追踪记录
+cron 查到结果后写入 `results/{taskId}.md`。用户收到结果有两种途径：
 
-用户在其 webchat session 中会直接收到结果消息。
+### 途径 A：用户主动问（最快）
+用户问"结果出来了吗"或发任何消息时，agent 检查 results 目录，如果有新结果就直接回复。
+
+### 途径 B：心跳自动检查（兜底）
+心跳时检查 `results/` 目录，发现新结果文件时，读取内容并在当前对话中回复用户。
+**注意**：心跳回复能否到达用户取决于当前 session 类型，webchat 用户需要在下次对话时拿到结果。
+
+### 结果文件管理
+- 结果文件路径：`/home/admin/.openclaw/workspace/skills/inquiry-1688/results/{taskId}.md`
+- agent 回复用户后，删除结果文件（避免重复推送）
+- 心跳检查 results 目录时也遵循同样的读取→回复→删除流程
 
 回复格式参考：
 
@@ -149,12 +150,14 @@ job={
 - `questionList` 固定填 `["自定义"]`，用户实际问题放入 `requirementContent`
 - `isRequirementOriginal` 设为 `true`，原文发送
 - **不要轮询！** submit 后创建 cron，20 分钟后 query 一次就够
-- **cron 用 `sessionTarget: isolated` + `payload.kind: agentTurn`**，在独立 session 里查询并用 `sessions_send` 推送结果
-- **delivery.mode 必须是 `none`**，结果通过 sessions_send 发送，不走 announce
+- **cron 用 `sessionTarget: isolated` + `payload.kind: agentTurn`**，在独立 session 里查询并把结果写到文件
+- **delivery.mode 必须是 `none`**
 - 时间计算必须用 `date -u -d '+20 minutes' --iso-8601=seconds`
-- **必须在提交时记录用户的 session key**，cron agentTurn 需要它来 sessions_send
 - 如果用户中途问"结果出来了吗"，可以提前 query 一次看看
+- **每次用户发消息时，先检查 results 目录有没有待投递的结果文件**
 - ⚠️ **不要用 systemEvent + main session！** 回复会发到 heartbeat session 而不是用户 session（教训 #13）
+- ⚠️ **不要用 sessions_send 推送结果！** 回复走 announce 通道，用户体验差（教训 #15）
+- ⚠️ **不要用 message 工具发 webchat！** webchat 不是可外发的 channel（教训 #16）
 
 ## 兜底机制：心跳检查未完成询盘
 
@@ -196,3 +199,6 @@ job={
 > 12. ✅ **修复**：systemEvent 文本改为完全自包含，包含所有必要信息和明确操作指令，不依赖任何 session 上下文
 > 13. ❌ systemEvent 触发后，回复发到了 heartbeat session（agent:main:main），而不是用户的 webchat session（agent:main:openresponses-user:xxx）。用户看不到回复。根本原因：systemEvent 走主 session 的心跳通道，回复目标是心跳 session，不是用户 session
 > 14. ✅ **彻底重构**：改用 isolated agentTurn + sessions_send。cron 触发独立 session 查询结果，然后用 sessions_send 主动推送到用户的 webchat session。不再使用 systemEvent
+> 15. ❌ isolated agentTurn + sessions_send：sessions_send 确实把消息注入到了用户 session，agent 也生成了回复，但回复的 delivery.mode 是 "announce"（跨 session 投递），用户看到的是 "Agent-to-agent announce step" 而不是直接对话。内容虽然最终送达了，但用户体验差，看起来像系统消息而不是正常回复。根本原因：sessions_send 触发的回复走 announce 通道，不走 webchat 直连通道
+> 16. ❌ message 工具发 webchat：webchat 不是可外发的 channel，`message action=send channel=webchat` 报 "Unknown channel: webchat"，不指定 channel 报 "no configured channels detected"
+> 17. ✅ **最终方案（被动模式）**：cron isolated agentTurn 只负责查询结果并写入文件（results/{taskId}.md），不尝试任何跨 session 推送。用户下次发消息时 agent 检查 results 目录，发现新结果就直接回复。心跳也可兜底检查。牺牲实时性换取可靠性
