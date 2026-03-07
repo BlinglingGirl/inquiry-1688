@@ -54,7 +54,21 @@ python3 scripts/inquiry.py submit "<商品链接或ID>" "<询盘问题>" [--quan
 从响应中提取 `result.data` 作为 taskId。提交成功后告知用户：
 > 询盘已发送给供应商，20分钟后给你结果 ✅
 
-## Step 3: 创建 cron systemEvent
+## Step 3: 写入追踪文件 + 创建 cron systemEvent
+
+### 3a: 写入追踪文件（兜底机制）
+
+将待查询的任务信息追加到追踪文件，用于心跳兜底检查：
+
+```bash
+# 追踪文件路径
+TRACK_FILE="/home/admin/.openclaw/workspace/skills/inquiry-1688/pending_inquiries.json"
+
+# 写入格式（JSON Lines，每行一个任务）：
+echo '{"taskId":"<taskId>","productId":"<商品ID>","url":"<商品链接>","question":"<用户问题>","submitTime":"<ISO时间>","cronJobId":"<cron任务ID>"}' >> "$TRACK_FILE"
+```
+
+### 3b: 创建 cron systemEvent
 
 ⚠️ **时间计算必须用 `date` 命令，禁止手算！**
 
@@ -73,7 +87,7 @@ job={
   "sessionTarget": "main",
   "payload": {
     "kind": "systemEvent",
-    "text": "🔔 询盘提醒：任务 {taskId} 已到20分钟，请立即查询结果并回复用户。\n\n请执行：\npython3 /home/admin/.openclaw/workspace/skills/inquiry-1688/scripts/inquiry.py query \"{taskId}\"\n\n查询后按以下格式总结回复用户：\n\n商品链接: {链接}\n询盘问题: {用户的问题}"
+    "text": "🔔 询盘提醒：任务 {taskId} 已到20分钟，请立即查询结果并回复用户。\n\n请执行：\npython3 /home/admin/.openclaw/workspace/skills/inquiry-1688/scripts/inquiry.py query \"{taskId}\"\n\n查询后按以下格式总结回复用户：\n\n商品链接: {链接}\n询盘问题: {用户的问题}\n\n⚠️ 回复用户后，务必从追踪文件中删除该任务：\npython3 /home/admin/.openclaw/workspace/skills/inquiry-1688/scripts/inquiry.py remove-pending \"{taskId}\""
   },
   "deleteAfterRun": true,
   "wakeMode": "now"
@@ -91,6 +105,12 @@ job={
 
 ```bash
 python3 scripts/inquiry.py query "{taskId}"
+```
+
+**回复用户后，务必清除追踪记录：**
+
+```bash
+python3 scripts/inquiry.py remove-pending "{taskId}"
 ```
 
 拿到 JSON 结果后，按以下格式总结回复用户：
@@ -126,6 +146,29 @@ python3 scripts/inquiry.py query "{taskId}"
 - ⚠️ **cron 必须设置 `wakeMode: now`**，否则 systemEvent 要等心跳才处理，用户等不到结果（教训：2026-03-06 默认 next-heartbeat 导致 systemEvent 没被及时处理）
 - 如果用户中途问"结果出来了吗"，可以提前 query 一次看看
 
+## 兜底机制：心跳检查未完成询盘
+
+**为什么需要兜底**：cron systemEvent 注入主 session 时，如果主 session 正忙（用户在对话），会 `timeout waiting for main lane to become idle` 被 skipped。一次性 `at` 任务 skipped 后不会重试，结果就永远丢了。
+
+**追踪文件**：`/home/admin/.openclaw/workspace/skills/inquiry-1688/pending_inquiries.json`（JSON Lines 格式）
+
+**心跳检查流程**（应加入 HEARTBEAT.md）：
+
+```
+如果 pending_inquiries.json 存在且非空：
+  1. 逐行读取每个待查询任务
+  2. 检查 submitTime 是否已超过 20 分钟
+  3. 如果已超时，执行 query 并回复用户
+  4. 回复后执行 remove-pending 清除记录
+```
+
+**HEARTBEAT.md 应包含如下检查项**：
+
+```markdown
+- 检查询盘追踪文件 `/home/admin/.openclaw/workspace/skills/inquiry-1688/pending_inquiries.json`，
+  如果有超过20分钟的待查询任务，立即 query 并回复用户，然后 remove-pending 清除。
+```
+
 ## 教训记录
 
 > **2026-03-05 ~ 03-06 连续踩坑：**
@@ -137,3 +180,5 @@ python3 scripts/inquiry.py query "{taskId}"
 > 6. ❌ sleep 1200 同步等：yieldMs 超系统上限，exec 被后台化，结果拿不回来
 > 7. ❌ cron systemEvent + wakeMode 默认（next-heartbeat）：systemEvent 注入了但要等心跳才处理，用户等不到结果
 > 8. ✅ **最终方案**：submit → cron systemEvent（20分钟后注入主session，wakeMode=now 立即唤醒）→ agent 收到后 query 一次 → 直接回复用户
+> 9. ❌ cron systemEvent wakeMode=now 但主 session 忙：报 "timeout waiting for main lane to become idle"，任务被 skipped，用户收不到结果
+> 10. ✅ **兜底修复**：除 cron 外，同时写入 pending_inquiries.json 追踪文件，心跳时兜底检查超时任务并补回结果

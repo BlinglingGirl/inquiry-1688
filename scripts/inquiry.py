@@ -157,6 +157,61 @@ def cmd_poll(args):
             return
 
 
+# ── Pending tracking ─────────────────────────────────────────────────────────
+
+PENDING_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "pending_inquiries.json")
+
+
+def cmd_remove_pending(args):
+    """Remove a task from the pending tracking file."""
+    task_id = args.task_id
+    if not os.path.exists(PENDING_FILE):
+        print("No pending file found.", file=sys.stderr)
+        return
+
+    remaining = []
+    removed = False
+    with open(PENDING_FILE, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+                if entry.get("taskId") == task_id:
+                    removed = True
+                    continue
+                remaining.append(line)
+            except json.JSONDecodeError:
+                remaining.append(line)
+
+    if removed:
+        with open(PENDING_FILE, "w") as f:
+            for line in remaining:
+                f.write(line + "\n")
+        print("Removed task {} from pending file.".format(task_id))
+    else:
+        print("Task {} not found in pending file.".format(task_id), file=sys.stderr)
+
+
+def cmd_list_pending(args):
+    """List all pending inquiry tasks."""
+    if not os.path.exists(PENDING_FILE):
+        print("[]")
+        return
+    entries = []
+    with open(PENDING_FILE, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    print(json.dumps(entries, ensure_ascii=False, indent=2))
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -179,6 +234,13 @@ def main():
     p_poll = sub.add_parser("poll", help="轮询询盘结果（每30秒，最多20分钟）")
     p_poll.add_argument("task_id", help="任务ID")
 
+    # remove-pending
+    p_remove = sub.add_parser("remove-pending", help="从追踪文件中删除已完成的任务")
+    p_remove.add_argument("task_id", help="任务ID")
+
+    # list-pending
+    sub.add_parser("list-pending", help="列出所有待查询的询盘任务")
+
     args = parser.parse_args()
     if args.command == "submit":
         cmd_submit(args)
@@ -186,6 +248,10 @@ def main():
         cmd_query(args)
     elif args.command == "poll":
         cmd_poll(args)
+    elif args.command == "remove-pending":
+        cmd_remove_pending(args)
+    elif args.command == "list-pending":
+        cmd_list_pending(args)
 
 
 if __name__ == "__main__":
