@@ -87,7 +87,7 @@ job={
   "sessionTarget": "main",
   "payload": {
     "kind": "systemEvent",
-    "text": "🔔 询盘提醒：任务 {taskId} 已到20分钟，请立即查询结果并回复用户。\n\n请执行：\npython3 /home/admin/.openclaw/workspace/skills/inquiry-1688/scripts/inquiry.py query \"{taskId}\"\n\n查询后按以下格式总结回复用户：\n\n商品链接: {链接}\n询盘问题: {用户的问题}\n\n⚠️ 回复用户后，务必从追踪文件中删除该任务：\npython3 /home/admin/.openclaw/workspace/skills/inquiry-1688/scripts/inquiry.py remove-pending \"{taskId}\""
+    "text": "🔔 询盘结果待查询——这是一个定时任务，不依赖任何 session 上下文。\n\n## 你必须执行以下操作：\n\n1. 执行查询命令：\npython3 /home/admin/.openclaw/workspace/skills/inquiry-1688/scripts/inquiry.py query \"{taskId}\"\n\n2. 将查询结果总结后回复用户（用户之前问的问题如下）：\n   - 商品链接: {链接}\n   - 询盘问题: {用户的问题}\n\n3. 回复格式参考（直接发给用户，不需要额外上下文）：\n   📋 询盘结果\n   商品: xxx（¥价格）\n   供应商: xxx\n   各问题的回答\n\n4. 回复用户后，清除追踪记录：\npython3 /home/admin/.openclaw/workspace/skills/inquiry-1688/scripts/inquiry.py remove-pending \"{taskId}\"\n\n⚠️ 即使当前 session 没有之前的对话记录，也必须执行上述操作并直接回复用户！"
   },
   "deleteAfterRun": true,
   "wakeMode": "now"
@@ -182,3 +182,5 @@ python3 scripts/inquiry.py remove-pending "{taskId}"
 > 8. ✅ **最终方案**：submit → cron systemEvent（20分钟后注入主session，wakeMode=now 立即唤醒）→ agent 收到后 query 一次 → 直接回复用户
 > 9. ❌ cron systemEvent wakeMode=now 但主 session 忙：报 "timeout waiting for main lane to become idle"，任务被 skipped，用户收不到结果
 > 10. ✅ **兜底修复**：除 cron 外，同时写入 pending_inquiries.json 追踪文件，心跳时兜底检查超时任务并补回结果
+> 11. ❌ 用户 /new 重置 session 后，cron systemEvent 注入新 session，新 session 没有上下文不知道该干啥，结果又丢了
+> 12. ✅ **修复**：systemEvent 文本改为完全自包含，包含所有必要信息和明确操作指令，不依赖任何 session 上下文
